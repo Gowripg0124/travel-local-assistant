@@ -43,7 +43,7 @@ class QuestionRequest(BaseModel):
 
 class UploadedDocument(BaseModel):
     name: str
-    content: str
+    data_base64: str
 
 
 class DocumentsRequest(BaseModel):
@@ -96,21 +96,13 @@ def build_history_context(
 @app.post("/documents")
 def upload_documents(request: DocumentsRequest):
 
-    chunks = add_documents(
+    return add_documents(
         request.session_id,
         [
             document.model_dump()
             for document in request.documents
         ]
     )
-
-    return {
-        "documents": [
-            document.name
-            for document in request.documents
-        ],
-        "chunks": chunks
-    }
 
 
 @app.delete("/documents/{session_id}")

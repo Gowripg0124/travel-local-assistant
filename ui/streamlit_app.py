@@ -1,9 +1,7 @@
-import io
+import base64
 import sys
 import uuid
-import zipfile
 from pathlib import Path
-from xml.etree import ElementTree
 
 import requests
 import streamlit as st
@@ -36,10 +34,6 @@ SUPPORTED_FILE_TYPES = [
     "json"
 ]
 
-# Limit extracted text per document so the
-# API payload stays reasonably small.
-MAX_DOCUMENT_CHARS = 20000
-
 DEFAULT_DOCUMENT_QUESTION = (
     "Please summarize the attached document(s)."
 )
@@ -63,8 +57,8 @@ st.set_page_config(
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Documents attached during the conversation,
-# keyed by file name -> extracted text.
+# Names of documents attached during the
+# conversation (stored on the API server).
 if "documents" not in st.session_state:
     st.session_state.documents = {}
 
@@ -78,117 +72,15 @@ if "session_id" not in st.session_state:
 # HELPER FUNCTIONS
 # =========================================================
 
-def extract_document_text(uploaded_file):
-    """
-    Extract plain text from an uploaded file.
-    """
-
-    extension = Path(
-        uploaded_file.name
-    ).suffix.lower().lstrip(".")
-
-    data = uploaded_file.getvalue()
-
-    # ---------------------------------------------
-    # PDF
-    # ---------------------------------------------
-
-    if extension == "pdf":
-
-        from pypdf import PdfReader
-
-        reader = PdfReader(
-            io.BytesIO(data)
-        )
-
-        text = "\n".join(
-            page.extract_text() or ""
-            for page in reader.pages
-        )
-
-    # ---------------------------------------------
-    # DOCX (read word/document.xml directly)
-    # ---------------------------------------------
-
-    elif extension == "docx":
-
-        namespace = (
-            "{http://schemas.openxmlformats.org/"
-            "wordprocessingml/2006/main}"
-        )
-
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-
-            root = ElementTree.fromstring(
-                archive.read("word/document.xml")
-            )
-
-        paragraphs = []
-
-        for paragraph in root.iter(f"{namespace}p"):
-
-            paragraphs.append(
-                "".join(
-                    node.text or ""
-                    for node in paragraph.iter(f"{namespace}t")
-                )
-            )
-
-        text = "\n".join(paragraphs)
-
-    # ---------------------------------------------
-    # TXT / CSV / MD / JSON
-    # ---------------------------------------------
-
-    else:
-
-        text = data.decode(
-            "utf-8",
-            errors="replace"
-        )
-
-    return text.strip()[:MAX_DOCUMENT_CHARS]
-
-
 def process_attachments(files):
     """
-    Extract text from attached files and upload
-    them to the API for this chat session.
-    Returns the names of files that were
-    attached successfully.
+    Upload attached files to the API for this
+    chat session. The API extracts, chunks and
+    embeds them. Returns the names of files that
+    were attached successfully.
     """
 
-    extracted = {}
-
-    for uploaded_file in files:
-
-        try:
-
-            text = extract_document_text(
-                uploaded_file
-            )
-
-        except Exception as e:
-
-            st.warning(
-                f"Could not read {uploaded_file.name}: {e}"
-            )
-
-            continue
-
-        if not text:
-
-            st.warning(
-                f"No readable text found in {uploaded_file.name}."
-            )
-
-            continue
-
-        extracted[
-            uploaded_file.name
-        ] = text
-
-    if not extracted:
+    if not files:
         return []
 
     try:
@@ -203,16 +95,20 @@ def process_attachments(files):
                     "session_id": st.session_state.session_id,
                     "documents": [
                         {
-                            "name": name,
-                            "content": text
+                            "name": uploaded_file.name,
+                            "data_base64": base64.b64encode(
+                                uploaded_file.getvalue()
+                            ).decode("ascii")
                         }
-                        for name, text in extracted.items()
+                        for uploaded_file in files
                     ]
                 },
-                timeout=120
+                timeout=180
             )
 
             response.raise_for_status()
+
+            result = response.json()
 
     except requests.exceptions.RequestException as e:
 
@@ -222,11 +118,21 @@ def process_attachments(files):
 
         return []
 
-    st.session_state.documents.update(
-        extracted
+    for name, error in result.get("errors", {}).items():
+
+        st.warning(
+            f"{name}: {error}"
+        )
+
+    attached_names = result.get(
+        "documents",
+        []
     )
 
-    return list(extracted)
+    for name in attached_names:
+        st.session_state.documents[name] = True
+
+    return attached_names
 
 
 def clear_uploaded_documents():
