@@ -390,14 +390,32 @@ Current question:
     # GEMINI QUOTA ERROR
     # =====================================================
 
-    except GoogleRateLimitError:
+    except GoogleRateLimitError as e:
+
+        print("\n========== GEMINI QUOTA ERROR ==========")
+        print(e)
+        print("========================================\n")
+
+        # The free tier has a small per-day request limit;
+        # a "retry in N seconds" hint doesn't apply to it.
+        if "PerDay" in str(e):
+            quota_hint = (
+                "The daily Gemini free-tier request limit "
+                "has been reached. It resets at midnight "
+                "Pacific Time, or you can enable billing "
+                "for the API key."
+            )
+        else:
+            quota_hint = (
+                "Too many requests in a short time. "
+                "Please wait a minute and try again."
+            )
 
         return {
             "question": request.question,
             "route": "error",
             "answer": (
-                "⚠️ Gemini API quota exceeded. "
-                "Please try again after the quota resets."
+                f"⚠️ Gemini API quota exceeded. {quota_hint}"
             ),
             "sources": [],
             "places": []
