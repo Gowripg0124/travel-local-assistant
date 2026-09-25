@@ -1,6 +1,5 @@
 import base64
 import io
-import os
 import re
 import zipfile
 from pathlib import Path
@@ -13,14 +12,9 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from rag.rag_service import llm, extract_text
-from rag.retriever import RELEVANCE_THRESHOLD
+from services.query_analyzer import detect_intents
 
 load_dotenv()
-
-MOCK_LLM = os.getenv(
-    "MOCK_LLM",
-    "false"
-).lower() == "true"
 
 
 # =========================================================
@@ -69,23 +63,62 @@ DOCUMENT_REFERENCE_WORDS = {
 
 
 DOCUMENT_PROMPT = """
-You are a helpful assistant answering questions about
-documents the user has uploaded. The documents can be
-about any topic.
+You are a document analysis assistant. The user has
+uploaded one or more documents, which can be about any
+topic (for example a score report, resume, financial
+report, project plan, notes or data file), and is asking
+a question about them.
 
 Each context section below is an excerpt from an uploaded
 document and starts with its source filename (and page
 number where available).
 
+HOW TO RESPOND
 {relevance_instruction}
-- If the answer or the information needed is not in the
-  context, reply with exactly: "{not_found}"
+- If the document does not contain the information needed
+  to answer, reply with exactly: "{not_found}"
+  Questions asking for analysis, feedback, priorities or
+  improvement advice ARE answerable whenever the documents
+  contain material to analyse.
 
-- Otherwise, answer using ONLY the information in the
-  context. You may summarise, analyse, compare documents
-  and give recommendations, but base every statement on
-  the document content and do not invent facts.
-  Mention the source filename(s) your answer came from.
+- Never copy or dump the document content back to the
+  user. Answer the question by analysing, synthesising and
+  organising the relevant information.
+
+- Adapt the answer to the question:
+  * Factual question: answer directly and concisely.
+  * Summary / key points / key issues: give the most
+    important points, grouped logically.
+  * Analysis, "where can I improve", "what should I focus
+    on", feedback or review: work out the document's type
+    and evaluate it accordingly, then:
+      1. Identify the weakest or most problematic areas and
+         prioritise them, most important first. Include the
+         exact scores, percentages, figures or evidence the
+         document gives for each.
+      2. Explain briefly what each area is about, using the
+         document's own description where it has one.
+      3. Give practical, specific suggestions for improving
+         each area.
+      4. Where useful, list the strong areas separately.
+      5. Finish with a short overall plan or next steps.
+  * Comparison across documents: compare them explicitly
+    and name the document each point comes from.
+
+- Grounding rules:
+  * Every fact, score, name, figure and claim must come
+    from the context. Never invent or estimate values, and
+    never add topics or items the document doesn't mention.
+  * Your suggestions and advice may use general knowledge,
+    but only about the topics and items that are actually
+    in the document.
+  * If the context looks incomplete for the question, say
+    which part you could not find.
+
+- Formatting: use Markdown headings, bullet points and bold
+  text for readability. Keep it focused, not verbose.
+
+- Name the source filename(s) your answer came from.
 
 Context:
 {context}
@@ -185,10 +218,8 @@ _embeddings = None
 _session_stores: dict[str, Chroma] = {}
 
 # Sessions whose next question should go to the uploaded
-# documents: a file was just uploaded, or the previous
-# question was answered from the documents.
+# documents because a file was just uploaded.
 _pending_upload: set[str] = set()
-_last_answer_from_documents: set[str] = set()
 
 
 def _get_embeddings():
@@ -351,7 +382,6 @@ def clear_documents(session_id: str):
 
     _session_stores.pop(session_id, None)
     _pending_upload.discard(session_id)
-    _last_answer_from_documents.discard(session_id)
 
 
 # =========================================================
@@ -410,19 +440,12 @@ def _retrieve(
 
     # Small uploads: use every chunk so whole-document
     # analysis and multi-document questions work.
+    # No similarity search is needed here, which saves
+    # an embedding request per question.
     if total_chars <= FULL_CONTEXT_CHARS:
 
-        scores = dict(
-            (document.page_content, score)
-            for document, score in
-            store.similarity_search_with_relevance_scores(
-                question,
-                k=CHUNKS_PER_DOCUMENT
-            )
-        )
-
         results = [
-            (chunk, scores.get(chunk.page_content, 0.0))
+            (chunk, 0.0)
             for chunk in all_chunks
         ]
 
@@ -527,55 +550,26 @@ def ask_documents(
         or _refers_to_documents(question, sources)
     )
 
-    # Likely a follow-up to a document answer.
-    follow_up = session_id in _last_answer_from_documents
-
     _pending_upload.discard(session_id)
+
+    # Nearby-places questions ("cafes near X") go straight
+    # to normal routing, saving a Gemini request.
+    if (
+        not definitely_documents
+        and "nearby" in detect_intents(question)
+    ):
+        return None
 
     results = _retrieve(store, question, sources)
 
     documents = [document for document, _ in results]
 
-    best_score = max(
-        (score for _, score in results),
-        default=0.0
-    )
-
     # =====================================================
-    # MOCK LLM
+    # GEMINI
     # =====================================================
-    # The mock can't judge relevance, so it uses explicit
-    # signals and the retrieval score threshold.
-
-    if MOCK_LLM:
-
-        if not (
-            definitely_documents
-            or follow_up
-            or best_score >= RELEVANCE_THRESHOLD
-        ):
-            _last_answer_from_documents.discard(session_id)
-            return None
-
-        _last_answer_from_documents.add(session_id)
-
-        context = "\n\n".join(
-            document.page_content
-            for document in documents
-        )
-
-        return {
-            "answer": (
-                "MOCK_LLM is enabled, so Gemini was not called. "
-                "Retrieved content from the uploaded documents:\n\n"
-                + context
-            ),
-            "sources": _format_sources(documents, sources)
-        }
-
-    # =====================================================
-    # REAL GEMINI
-    # =====================================================
+    # Document questions always go to Gemini, even when
+    # MOCK_LLM is enabled for the travel RAG, so the
+    # retrieved content is analysed, never returned raw.
 
     context = "\n\n".join(
         (
@@ -609,13 +603,15 @@ def ask_documents(
         not definitely_documents
         and answer.strip('"').startswith(NOT_RELEVANT_MARKER)
     ):
-        _last_answer_from_documents.discard(session_id)
         return None
 
-    _last_answer_from_documents.add(session_id)
-
-    # Don't cite sources for a "not found" answer.
-    if NOT_FOUND_MESSAGE.lower() in answer.lower():
+    # Don't cite sources for a "not found" answer. Only
+    # match a reply that is just the message, so a full
+    # analysis noting one missing detail is kept.
+    if (
+        answer.strip('"').strip().lower()
+        == NOT_FOUND_MESSAGE.lower()
+    ):
 
         return {
             "answer": NOT_FOUND_MESSAGE,
