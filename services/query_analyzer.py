@@ -181,6 +181,13 @@ def extract_location_from_text(text: str) -> str | None:
 
         r"\btraveling to\s+(.+?)(?:[.!?]|$)",
         r"\btravelling to\s+(.+?)(?:[.!?]|$)",
+
+        # -----------------------------------------
+        # "restaurants in Saravanampatti, Coimbatore"
+        # (checked last; skips "in the/this/my ...")
+        # -----------------------------------------
+
+        r"\bin\s+(?!(?:the|this|that|these|those|my|your|our|a|an|it)\b)(.+?)(?:[.!?]|$)",
     ]
 
     for pattern in patterns:
@@ -539,6 +546,38 @@ def is_location_change_query(
 
 
 # =========================================================
+# ASSISTANT ASKED FOR LOCATION
+# =========================================================
+
+def assistant_asked_for_location(history) -> bool:
+    """
+    True when the last assistant message asked the
+    user for a location (see places_service).
+    """
+
+    if not history:
+        return False
+
+    for message in reversed(history):
+
+        if isinstance(message, dict):
+            role = message.get("role", "")
+            content = message.get("content", "")
+        else:
+            role = getattr(message, "role", "")
+            content = getattr(message, "content", "")
+
+        if role.lower() != "assistant":
+            continue
+
+        return content.startswith(
+            "I need a location"
+        )
+
+    return False
+
+
+# =========================================================
 # QUERY ANALYZER
 # =========================================================
 
@@ -616,6 +655,34 @@ def analyze_query(
         intents = [
             previous_place_intent
         ]
+
+    # -----------------------------------------
+    # Reply to "I need a location..."
+    #
+    # Example:
+    #
+    # nearby restaurants
+    #        ↓
+    # I need a location ... (assistant)
+    #        ↓
+    # Saravanampatti, Coimbatore
+    #
+    # becomes:
+    #
+    # restaurant + Saravanampatti, Coimbatore
+    # -----------------------------------------
+
+    if (
+        not intents
+        and previous_place_intent
+        and assistant_asked_for_location(history)
+    ):
+        intents = [
+            previous_place_intent
+        ]
+
+        if not location:
+            location = question.strip(" .,!?")
 
     # -----------------------------------------
     # Use previous location only when
