@@ -2,7 +2,7 @@ import base64
 import sys
 import uuid
 from pathlib import Path
-
+import os
 import requests
 import streamlit as st
 
@@ -21,7 +21,10 @@ if str(PROJECT_ROOT) not in sys.path:
 # CONFIGURATION
 # =========================================================
 
-API_URL = "http://127.0.0.1:8000/ask"
+API_URL = os.getenv(
+    "API_URL",
+    "http://127.0.0.1:8000/ask"
+)
 
 DOCUMENTS_URL = "http://127.0.0.1:8000/documents"
 
