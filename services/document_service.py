@@ -43,6 +43,12 @@ FULL_CONTEXT_CHARS = 40000
 
 CHUNKS_PER_DOCUMENT = 4
 
+# Per-call limits for document questions: worst case
+# is about 3 x 50s, under the UI's 180s wait.
+GEMINI_TIMEOUT_SECONDS = 50
+
+GEMINI_MAX_ATTEMPTS = 3
+
 NOT_FOUND_MESSAGE = (
     "I could not find that information "
     "in the uploaded documents."
@@ -374,6 +380,50 @@ def add_documents(
     }
 
 
+def list_documents(session_id: str) -> list[str]:
+    """
+    Names of the documents stored for a session.
+    """
+
+    if not has_documents(session_id):
+        return []
+
+    return sorted(
+        {
+            metadata.get("source", "unknown")
+            for metadata in _get_store(session_id)
+            .get(include=["metadatas"])["metadatas"]
+        }
+    )
+
+
+def move_documents(source_id: str, target_id: str):
+    """
+    Move stored chunks (with their embeddings) from
+    one session to another, e.g. a guest's documents
+    into their new account. No re-embedding.
+    """
+
+    if not has_documents(source_id):
+        return
+
+    data = _get_store(source_id)._collection.get(
+        include=["documents", "metadatas", "embeddings"]
+    )
+
+    _get_store(target_id)._collection.add(
+        ids=data["ids"],
+        documents=data["documents"],
+        metadatas=data["metadatas"],
+        embeddings=data["embeddings"]
+    )
+
+    if source_id in _pending_upload:
+        _pending_upload.add(target_id)
+
+    clear_documents(source_id)
+
+
 def clear_documents(session_id: str):
 
     store = _get_store(session_id)
@@ -595,8 +645,15 @@ def ask_documents(
         question=contextual_question or question
     )
 
+    # Bound each attempt: when Gemini is overloaded
+    # (HTTP 503) a call with no timeout can hang, and
+    # the default 6 retries can outlast the UI's wait.
     answer = extract_text(
-        llm.invoke(prompt)
+        llm.invoke(
+            prompt,
+            timeout=GEMINI_TIMEOUT_SECONDS,
+            max_retries=GEMINI_MAX_ATTEMPTS
+        )
     ).strip()
 
     if (

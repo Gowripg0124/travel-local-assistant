@@ -5,3 +5,5 @@ vectorstore/
 *.pyc
 .DS_Store
 vectorstore_uploads/
+app.db
+app.db-*

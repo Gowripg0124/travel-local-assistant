@@ -1,4 +1,8 @@
-from services.query_analyzer import analyze_query
+from services.query_analyzer import (
+    analyze_query,
+    is_knowledge_question,
+    is_place_search
+)
 
 
 def route_question(
@@ -16,26 +20,18 @@ def route_question(
     if "conversation" in intents:
         return "conversation"
 
-    places_intents = [
-        "restaurant",
-        "cafe",
-        "hotel"
-    ]
-
-    rag_intents = [
-        "attraction",
-        "food",
-        "general"
-    ]
-
-    has_places_intent = any(
-        intent in places_intents
-        for intent in intents
+    # A live search for a place type in any location.
+    # Never depends on which travel documents exist.
+    has_places_intent = is_place_search(
+        question,
+        intents,
+        history
     )
 
-    has_rag_intent = any(
-        intent in rag_intents
-        for intent in intents
+    # Asks for information about a place or topic.
+    has_rag_intent = is_knowledge_question(
+        question,
+        intents
     )
 
     if has_places_intent and has_rag_intent:
@@ -44,4 +40,7 @@ def route_question(
     if has_places_intent:
         return "places"
 
+    # Knowledge questions. The API answers from the
+    # travel documents when relevant ones exist, and
+    # otherwise falls back to a general answer.
     return "rag"

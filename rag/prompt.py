@@ -21,3 +21,24 @@ Question:
 
 Answer:
 """
+
+# Used only for general questions that the travel
+# documents don't cover. Not restricted to context.
+GENERAL_PROMPT = """
+You are a helpful travel assistant.
+
+Answer the user's question clearly and concisely from
+your general knowledge.
+
+If the question depends on details that change often
+(prices, opening hours, availability, events), say so
+and suggest checking an up-to-date source.
+
+If you don't know the answer, say so instead of
+guessing.
+
+Question:
+{question}
+
+Answer:
+"""

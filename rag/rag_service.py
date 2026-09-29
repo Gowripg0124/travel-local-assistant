@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from rag.retriever import get_retriever
-from rag.prompt import SYSTEM_PROMPT
+from rag.prompt import GENERAL_PROMPT, SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -15,7 +15,7 @@ MOCK_LLM = os.getenv(
 
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash"
+    model="gemini-3.5-flash"
 )
 
 
@@ -39,13 +39,36 @@ def extract_text(response):
     return "\n".join(text_parts)
 
 
-def ask_rag(question: str):
+def ask_rag(question: str, location: str | None = None):
+    """
+    location: when the question names a place, keep only
+    retrieved documents that mention it, so a guide for
+    another city isn't used as the answer.
+    """
 
     retriever = get_retriever()
 
     documents = retriever.invoke(
         question
     )
+
+    if location:
+
+        # "RS Puram, Coimbatore" matches either part.
+        names = [
+            part.strip().lower()
+            for part in location.split(",")
+            if part.strip()
+        ]
+
+        documents = [
+            document
+            for document in documents
+            if any(
+                name in document.page_content.lower()
+                for name in names
+            )
+        ]
 
     if not documents:
 
@@ -109,4 +132,31 @@ def ask_rag(question: str):
     return {
         "answer": answer,
         "sources": sources
+    }
+
+def ask_general(question: str):
+    """
+    Answer a general question that the travel
+    documents don't cover, without the
+    context-only restriction of the RAG prompt.
+
+    Always calls Gemini, even when MOCK_LLM is on (like
+    uploaded-document questions): there is no retrieved
+    text to show instead, so a mock can't answer.
+    """
+
+    # Same limits as document questions, so a busy
+    # Gemini fails with a clear error instead of
+    # outlasting the UI's wait.
+    response = llm.invoke(
+        GENERAL_PROMPT.format(
+            question=question
+        ),
+        timeout=50,
+        max_retries=3
+    )
+
+    return {
+        "answer": extract_text(response),
+        "sources": []
     }

@@ -38,6 +38,43 @@ INTENT_KEYWORDS = {
 }
 
 
+# Words that follow "near"/"around" but aren't places.
+NOT_A_LOCATION = {
+    "me", "here", "my location", "my place",
+    "my hotel", "where i am", "us"
+}
+
+# Place-type intents the live Places service can search.
+PLACE_TYPE_INTENTS = {"restaurant", "cafe", "hotel"}
+
+# Words showing the user wants a live search, not
+# information ("difference between a hotel and a resort").
+PLACE_SEARCH_WORDS = {
+    "find", "show", "search", "list", "recommend",
+    "suggest", "best", "top", "good", "any", "some",
+    "nearby", "near", "around", "close", "looking"
+}
+
+# Phrases asking for knowledge about a place or topic.
+KNOWLEDGE_PHRASES = [
+    "famous for", "known for", "tell me about",
+    "tell me more about", "information about",
+    "history of", "things to do", "what to do",
+    "what to see", "worth visiting", "should i visit",
+    "places to visit", "attractions", "mentioned",
+    "according to", "travel information", "travel guide",
+    "travel documents"
+]
+
+# Phrases that explicitly ask what the travel documents
+# say; these must not fall back to a general answer.
+DOCUMENT_REFERENCE_PHRASES = [
+    "mentioned", "according to", "travel information",
+    "travel guide", "travel documents", "your documents",
+    "the documents", "knowledge base"
+]
+
+
 def detect_intents(question: str) -> list[str]:
 
     question_lower = question.lower()
@@ -149,7 +186,8 @@ def extract_location_from_text(text: str) -> str | None:
         # "how about Gandhipuram?"
         # -----------------------------------------
 
-        r"^(?:what|how)\s+about\s+(.+?)(?:[.!?]|$)",
+        # (skips "what about the food there?")
+        r"^(?:what|how)\s+about\s+(?!(?:the|this|that|these|those|it|my|your|our|a|an)\b)(.+?)(?:[.!?]|$)",
 
         # -----------------------------------------
         # "hotels near Saravanampatti"
@@ -188,6 +226,15 @@ def extract_location_from_text(text: str) -> str | None:
         # -----------------------------------------
 
         r"\bin\s+(?!(?:the|this|that|these|those|my|your|our|a|an|it)\b)(.+?)(?:[.!?]|$)",
+
+        # -----------------------------------------
+        # Knowledge phrasing
+        # "What is Ooty known for and ..."
+        # "Tell me about Ooty and ..."
+        # -----------------------------------------
+
+        r"\b(?:what\s+is|what's)\s+(.+?)\s+(?:known|famous)\s+for\b",
+        r"\btell\s+me\s+(?:more\s+)?about\s+(.+?)(?:\s+and\b|[.!?]|$)",
     ]
 
     for pattern in patterns:
@@ -225,9 +272,22 @@ def extract_location_from_text(text: str) -> str | None:
             flags=re.IGNORECASE
         )
 
+        # Remove a trailing clause after the place:
+        # "wayanad to visit" -> "wayanad"
+        location = re.sub(
+            r"\s+(?:to|for|which|that|with|where|what)\s+.*$",
+            "",
+            location,
+            flags=re.IGNORECASE
+        )
+
         location = location.strip(" ,.")
 
         if not location:
+            continue
+
+        # "near me" / "around here" aren't places.
+        if location.lower() in NOT_A_LOCATION:
             continue
 
         # -----------------------------------------
@@ -575,6 +635,73 @@ def assistant_asked_for_location(history) -> bool:
         )
 
     return False
+
+
+# =========================================================
+# QUESTION TYPE HELPERS (used by the router)
+# =========================================================
+
+def is_place_search(
+    question: str,
+    intents: list[str],
+    history=None
+) -> bool:
+    """
+    True when the user wants a live search for a place
+    type, not information about it. Never depends on
+    which travel documents exist.
+    """
+
+    if not PLACE_TYPE_INTENTS & set(intents):
+        return False
+
+    question_lower = question.lower()
+
+    words = set(re.findall(r"[a-z']+", question_lower))
+
+    return bool(
+        "nearby" in intents
+        or words & PLACE_SEARCH_WORDS
+        or "where can i" in question_lower
+        or "where to" in question_lower
+        or extract_location_from_text(question)
+        or is_location_change_query(question)
+        or assistant_asked_for_location(history)
+    )
+
+
+def is_knowledge_question(
+    question: str,
+    intents: list[str]
+) -> bool:
+    """
+    True when the question asks for information
+    (e.g. "known for", "tell me about", attractions).
+    """
+
+    question_lower = question.lower()
+
+    return bool(
+        {"attraction", "food"} & set(intents)
+        or any(
+            phrase in question_lower
+            for phrase in KNOWLEDGE_PHRASES
+        )
+    )
+
+
+def refers_to_travel_documents(question: str) -> bool:
+    """
+    True when the question explicitly asks what the
+    travel documents say ("attractions mentioned in X").
+    """
+
+    question_lower = question.lower()
+
+    return any(
+        phrase in question_lower
+        for phrase in DOCUMENT_REFERENCE_PHRASES
+    )
 
 
 # =========================================================
