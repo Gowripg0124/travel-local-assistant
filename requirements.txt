@@ -12,3 +12,4 @@ langchain-google-genai
 google-genai
 requests
 rapidfuzz
+razorpay

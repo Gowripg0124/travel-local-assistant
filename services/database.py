@@ -62,6 +62,58 @@ CREATE INDEX IF NOT EXISTS idx_conversations_user
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages(conversation_id, id);
+
+-- One row per user. Written only by the backend from
+-- verified payment-provider events, never the frontend.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    user_id INTEGER PRIMARY KEY
+        REFERENCES users(id) ON DELETE CASCADE,
+    plan_name TEXT NOT NULL,
+    -- free | active | canceled | expired | past_due
+    status TEXT NOT NULL,
+    provider TEXT,
+    subscription_id TEXT,
+    started_at TEXT,
+    expires_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+-- One row per counted interaction. Guests have no
+-- user_id and are identified by guest_key instead.
+CREATE TABLE IF NOT EXISTS usage_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER
+        REFERENCES users(id) ON DELETE CASCADE,
+    guest_key TEXT,
+    conversation_id INTEGER,
+    request_id TEXT NOT NULL,
+    -- message | document_upload
+    usage_type TEXT NOT NULL,
+    -- Nullable: only set when Gemini reported them.
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    total_tokens INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_user
+    ON usage_records(user_id, usage_type, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_usage_guest
+    ON usage_records(guest_key, usage_type, created_at);
+
+-- Processed payment-provider webhook events, so
+-- duplicate and out-of-order deliveries are skipped.
+CREATE TABLE IF NOT EXISTS payment_events (
+    event_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    subscription_id TEXT,
+    event_created_at TEXT,
+    received_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_events_subscription
+    ON payment_events(subscription_id, event_created_at);
 """
 
 
@@ -338,6 +390,169 @@ def list_messages(conversation_id: int) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# =========================================================
+# SUBSCRIPTIONS
+# =========================================================
+
+def get_subscription(user_id: int) -> dict | None:
+
+    with get_connection() as connection:
+
+        row = connection.execute(
+            "SELECT * FROM subscriptions WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def upsert_subscription(
+    user_id: int,
+    plan_name: str,
+    status: str,
+    provider: str | None = None,
+    subscription_id: str | None = None,
+    started_at: str | None = None,
+    expires_at: str | None = None
+):
+
+    with get_connection() as connection:
+
+        connection.execute(
+            "INSERT INTO subscriptions "
+            "(user_id, plan_name, status, provider, "
+            "subscription_id, started_at, expires_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "plan_name = excluded.plan_name, "
+            "status = excluded.status, "
+            "provider = excluded.provider, "
+            "subscription_id = excluded.subscription_id, "
+            "started_at = excluded.started_at, "
+            "expires_at = excluded.expires_at, "
+            "updated_at = excluded.updated_at",
+            (
+                user_id, plan_name, status, provider,
+                subscription_id, started_at, expires_at,
+                utc_now()
+            )
+        )
+
+
+# =========================================================
+# PAYMENT EVENTS (webhook idempotency)
+# =========================================================
+
+def payment_event_exists(event_id: str) -> bool:
+
+    with get_connection() as connection:
+
+        return connection.execute(
+            "SELECT 1 FROM payment_events WHERE event_id = ?",
+            (event_id,)
+        ).fetchone() is not None
+
+
+def latest_payment_event_at(subscription_id: str) -> str | None:
+
+    with get_connection() as connection:
+
+        return connection.execute(
+            "SELECT MAX(event_created_at) FROM payment_events "
+            "WHERE subscription_id = ?",
+            (subscription_id,)
+        ).fetchone()[0]
+
+
+def add_payment_event(
+    event_id: str,
+    provider: str,
+    subscription_id: str | None,
+    event_created_at: str | None
+):
+
+    with get_connection() as connection:
+
+        connection.execute(
+            "INSERT OR IGNORE INTO payment_events "
+            "(event_id, provider, subscription_id, "
+            "event_created_at, received_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                event_id, provider, subscription_id,
+                event_created_at, utc_now()
+            )
+        )
+
+
+# =========================================================
+# USAGE RECORDS
+# =========================================================
+
+def add_usage_record(
+    request_id: str,
+    usage_type: str,
+    user_id: int | None = None,
+    guest_key: str | None = None,
+    conversation_id: int | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    total_tokens: int | None = None
+):
+
+    with get_connection() as connection:
+
+        connection.execute(
+            "INSERT INTO usage_records "
+            "(user_id, guest_key, conversation_id, request_id, "
+            "usage_type, input_tokens, output_tokens, "
+            "total_tokens, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id, guest_key, conversation_id, request_id,
+                usage_type, input_tokens, output_tokens,
+                total_tokens, utc_now()
+            )
+        )
+
+
+def summarize_usage(
+    usage_type: str,
+    since: str | None = None,
+    user_id: int | None = None,
+    guest_key: str | None = None
+) -> dict:
+    """
+    Count and token totals for one user or guest.
+    Token sums are None when no tokens were recorded.
+    """
+
+    if user_id is not None:
+        owner_sql, owner = "user_id = ?", user_id
+    else:
+        owner_sql, owner = "guest_key = ?", guest_key
+
+    sql = (
+        "SELECT COUNT(*) AS count, "
+        "SUM(input_tokens) AS input_tokens, "
+        "SUM(output_tokens) AS output_tokens, "
+        "SUM(total_tokens) AS total_tokens "
+        f"FROM usage_records WHERE {owner_sql} "
+        "AND usage_type = ?"
+    )
+
+    params = [owner, usage_type]
+
+    if since:
+        sql += " AND created_at >= ?"
+        params.append(since)
+
+    with get_connection() as connection:
+        row = connection.execute(sql, params).fetchone()
+
+    return dict(row)
 
 
 if __name__ == "__main__":

@@ -49,14 +49,8 @@ DEFAULT_DOCUMENT_QUESTION = (
     "Please summarize the attached document(s)."
 )
 
-# Questions a guest can send before logging in.
-GUEST_MESSAGE_LIMIT = 5
-
-GUEST_LIMIT_MESSAGE = (
-    "You've reached the guest message limit. "
-    "Please log in or create an account to continue "
-    "chatting and save your conversations."
-)
+# Plan limits and usage come from the backend
+# (GET /account); nothing here decides them.
 
 
 # =========================================================
@@ -83,22 +77,31 @@ AUTH_STATE_KEYS = [
     "messages",
     "documents",
     "guest_token",
-    "guest_message_count",
-    "auth_panel_open"
+    "auth_panel_open",
+    "usage",
+    "account",
+    "page"
 ]
 
 # Logged-in user and their bearer token.
 if "auth_token" not in st.session_state:
     st.session_state.auth_token = None
 
-# Guests: a random token that keys the guest's own
-# uploaded documents on the server, and the number
-# of questions they have sent.
+# Guests: a random token that identifies this guest
+# session to the server (usage and uploaded documents).
 if "guest_token" not in st.session_state:
     st.session_state.guest_token = secrets.token_urlsafe(32)
 
-if "guest_message_count" not in st.session_state:
-    st.session_state.guest_message_count = 0
+# Plan, usage and account info last returned by the
+# backend, and the page shown (chat/settings/plans/help).
+if "usage" not in st.session_state:
+    st.session_state.usage = None
+
+if "account" not in st.session_state:
+    st.session_state.account = None
+
+if "page" not in st.session_state:
+    st.session_state.page = "chat"
 
 # Whether the login / sign-up panel is shown.
 if "auth_panel_open" not in st.session_state:
@@ -134,13 +137,16 @@ def is_guest():
     return not st.session_state.auth_token
 
 
+def usage_limit_reached():
+
+    usage = st.session_state.usage
+
+    return bool(usage and usage.get("limit_reached"))
+
+
 def guest_limit_reached():
 
-    return (
-        is_guest()
-        and st.session_state.guest_message_count
-        >= GUEST_MESSAGE_LIMIT
-    )
+    return is_guest() and usage_limit_reached()
 
 
 def api_request(
@@ -256,6 +262,130 @@ def open_conversation(conversation_id):
     }
 
     st.session_state.conversation_id = conversation_id
+
+
+def refresh_account():
+    """
+    Load plan, usage and account info from the backend,
+    which is the only source of truth for them.
+    """
+
+    try:
+
+        result = api_request("GET", "/account")
+
+    except APIError:
+
+        return
+
+    st.session_state.account = result["account"]
+    st.session_state.usage = result["usage"]
+
+
+def go_to(page):
+    """
+    Button callback: switch the main area's page.
+    """
+
+    st.session_state.page = page
+
+
+def start_upgrade(plan_id="pro"):
+    """
+    Ask the backend for a checkout link. The plan only
+    changes after the payment provider confirms payment,
+    so nothing here claims the upgrade succeeded.
+    """
+
+    if is_guest():
+
+        open_auth_panel("Sign up")
+
+        st.session_state.page = "chat"
+
+        return
+
+    try:
+
+        result = api_request(
+            "POST",
+            "/billing/checkout",
+            json={"plan": plan_id}
+        )
+
+    except APIError as e:
+
+        st.session_state.billing_notice = ("info", str(e))
+
+        return
+
+    st.session_state.billing_notice = (
+        "checkout_test" if result.get("test_mode") else "checkout",
+        result["checkout_url"]
+    )
+
+
+def open_billing_portal():
+
+    try:
+
+        result = api_request("POST", "/billing/portal")
+
+    except APIError as e:
+
+        st.session_state.billing_notice = ("info", str(e))
+
+        return
+
+    st.session_state.billing_notice = (
+        "portal",
+        result["portal_url"]
+    )
+
+
+def render_billing_notice():
+
+    notice = st.session_state.pop("billing_notice", None)
+
+    if not notice:
+        return
+
+    kind, value = notice
+
+    if kind == "info":
+
+        st.info(value)
+
+    else:
+
+        st.link_button(
+            "Continue to secure checkout"
+            if kind.startswith("checkout")
+            else "Manage your subscription",
+            value
+        )
+
+        if kind == "checkout_test":
+            st.caption(
+                "🧪 Test mode: no real money is charged. Use "
+                "the payment provider's test payment details."
+            )
+
+        st.caption(
+            "Your plan changes only after the payment "
+            "provider confirms the payment. Come back to this "
+            "page afterwards; your plan updates automatically."
+        )
+
+
+def format_date(value):
+
+    if not value:
+        return None
+
+    return datetime.fromisoformat(value).astimezone().strftime(
+        "%d %b %Y"
+    )
 
 
 # =========================================================
@@ -404,6 +534,7 @@ def open_auth_panel(mode):
 
     st.session_state.auth_panel_open = True
     st.session_state.auth_mode = mode
+    st.session_state.page = "chat"
 
 
 def complete_login(result):
@@ -459,7 +590,19 @@ def render_auth_panel():
     with st.container(border=True):
 
         if guest_limit_reached():
-            st.warning(GUEST_LIMIT_MESSAGE)
+
+            st.warning(
+                "You've reached the guest message limit. "
+                "Create an account or log in to continue "
+                "chatting and save your conversations."
+            )
+
+            st.button(
+                "View Plans",
+                key="guest_view_plans",
+                on_click=go_to,
+                args=("plans",)
+            )
         else:
             st.markdown(
                 "**Log in or create an account** to save "
@@ -529,6 +672,322 @@ def render_auth_panel():
         complete_login(result)
 
         st.rerun()
+
+
+def render_upgrade_panel():
+    """
+    Shown to logged-in users who reached their plan limit.
+    """
+
+    usage = st.session_state.usage
+
+    with st.container(border=True):
+
+        st.warning(
+            f"You've reached your {usage['plan_name']} plan "
+            f"limit ({usage['messages']['limit']} messages"
+            + (
+                f", resets {format_date(usage['resets_at'])}"
+                if usage.get("resets_at")
+                else ""
+            )
+            + ")."
+        )
+
+        st.write(
+            "Upgrade your plan to continue using the assistant."
+        )
+
+        view_column, upgrade_column = st.columns(2)
+
+        with view_column:
+
+            st.button(
+                "View Plans",
+                key="limit_view_plans",
+                width="stretch",
+                on_click=go_to,
+                args=("plans",)
+            )
+
+        with upgrade_column:
+
+            st.button(
+                "Upgrade",
+                key="limit_upgrade",
+                type="primary",
+                width="stretch",
+                on_click=start_upgrade
+            )
+
+        render_billing_notice()
+
+
+# =========================================================
+# PAGES: SETTINGS / PLANS / HELP
+# =========================================================
+
+def render_usage_summary(usage):
+
+    messages = usage["messages"]
+
+    st.markdown(f"**{usage['plan_name']} Plan**")
+
+    st.write(
+        f"AI usage: {messages['used']} / {messages['limit']} messages"
+        + (" this month" if usage["period"] == "month" else "")
+    )
+
+    st.progress(
+        min(messages["used"] / messages["limit"], 1.0)
+        if messages["limit"]
+        else 1.0
+    )
+
+    documents = usage["documents"]
+
+    st.write(
+        f"Documents uploaded: {documents['used']} / "
+        f"{documents['limit']}"
+        + (" this month" if usage["period"] == "month" else "")
+    )
+
+    # Only shown when Gemini actually reported tokens.
+    if usage["tokens"]["total_tokens"] is not None:
+        st.caption(
+            f"Tokens used: {usage['tokens']['total_tokens']:,}"
+        )
+
+    if usage.get("resets_at"):
+        st.caption(
+            f"Usage resets on {format_date(usage['resets_at'])}."
+        )
+
+
+def render_settings_page():
+
+    usage = st.session_state.usage
+
+    account = st.session_state.account
+
+    st.header("⚙️ Settings")
+
+    if not usage:
+
+        st.error("Couldn't load your account details.")
+
+        return
+
+    # ---------------------------------------------
+    # ACCOUNT
+    # ---------------------------------------------
+
+    st.subheader("Account")
+
+    if account:
+
+        st.write(f"Email: {account['email']}")
+
+        if account.get("created_at"):
+            st.write(
+                f"Member since: {format_date(account['created_at'])}"
+            )
+
+    else:
+
+        st.write(
+            "You're using the assistant as a guest. Chats "
+            "aren't saved."
+        )
+
+        login_column, signup_column = st.columns(2)
+
+        with login_column:
+            st.button(
+                "Login",
+                key="settings_login",
+                width="stretch",
+                on_click=open_auth_panel,
+                args=("Log in",)
+            )
+
+        with signup_column:
+            st.button(
+                "Sign Up",
+                key="settings_signup",
+                type="primary",
+                width="stretch",
+                on_click=open_auth_panel,
+                args=("Sign up",)
+            )
+
+    # ---------------------------------------------
+    # PLAN & SUBSCRIPTION
+    # ---------------------------------------------
+
+    st.subheader("Plan & Subscription")
+
+    subscription = usage.get("subscription")
+
+    st.write(f"Current plan: {usage['plan_name']}")
+
+    if subscription:
+
+        st.write(
+            f"Subscription status: {subscription['status']}"
+        )
+
+        if subscription.get("expires_at"):
+
+            label = (
+                "Renews on"
+                if subscription["status"] == "active"
+                else "Access until"
+            )
+
+            st.write(
+                f"{label}: {format_date(subscription['expires_at'])}"
+            )
+
+    elif account:
+
+        st.write("Subscription status: no paid subscription")
+
+    # ---------------------------------------------
+    # USAGE
+    # ---------------------------------------------
+
+    st.subheader("Usage")
+
+    render_usage_summary(usage)
+
+    # ---------------------------------------------
+    # ACTIONS
+    # ---------------------------------------------
+
+    plans_column, action_column = st.columns(2)
+
+    with plans_column:
+        st.button(
+            "View Plans",
+            key="settings_view_plans",
+            width="stretch",
+            on_click=go_to,
+            args=("plans",)
+        )
+
+    with action_column:
+
+        if subscription and usage["plan"] != "free":
+
+            st.button(
+                "Manage Subscription",
+                key="settings_manage",
+                width="stretch",
+                on_click=open_billing_portal
+            )
+
+        else:
+
+            st.button(
+                "Upgrade",
+                key="settings_upgrade",
+                type="primary",
+                width="stretch",
+                on_click=start_upgrade
+            )
+
+    render_billing_notice()
+
+
+def render_plans_page():
+
+    st.header("💳 Choose your plan")
+
+    try:
+        plans = api_request("GET", "/plans")
+    except APIError as e:
+        st.error(str(e))
+        return
+
+    current = (st.session_state.usage or {}).get("plan")
+
+    columns = st.columns(len(plans))
+
+    for column, plan in zip(columns, plans):
+
+        with column, st.container(border=True):
+
+            is_current = plan["id"] == current
+
+            st.subheader(
+                plan["name"] + (" ✓" if is_current else "")
+            )
+
+            st.write(
+                plan["price"]
+                or "Pricing not announced yet"
+            )
+
+            st.write(
+                f"- {plan['message_limit']} AI messages / "
+                f"{plan['period']}\n"
+                f"- {plan['document_limit']} document uploads / "
+                f"{plan['period']}\n"
+                + "".join(
+                    f"- {feature}\n"
+                    for feature in plan["features"]
+                )
+            )
+
+            if is_current:
+
+                st.caption("Your current plan")
+
+            elif plan["purchasable"]:
+
+                st.button(
+                    f"Upgrade to {plan['name']}",
+                    key=f"upgrade_{plan['id']}",
+                    type="primary",
+                    width="stretch",
+                    on_click=start_upgrade,
+                    args=(plan["id"],)
+                )
+
+    if is_guest():
+        st.caption(
+            "You're using the assistant as a guest. Create a "
+            "free account to get the Free plan."
+        )
+
+    render_billing_notice()
+
+
+def render_help_page():
+
+    st.header("❓ Help")
+
+    st.markdown(
+        "**What you can ask**\n"
+        "- Travel questions, answered from the built-in "
+        "travel guides when they cover the topic\n"
+        "- Live searches for restaurants, cafes and hotels "
+        "in any city or locality\n"
+        "- Questions about documents you attach with the 📎 "
+        "button (PDF, DOCX, TXT, CSV, MD, JSON)\n"
+        "- General questions\n\n"
+        "**Usage**\n"
+        "- Each question you send counts as one message; "
+        "uploads, replies and failed answers don't\n"
+        "- Your plan's limits are shown in Settings and "
+        "on the Plans page\n\n"
+        "**Accounts**\n"
+        "- Guests can try the assistant without signing up; "
+        "chats aren't saved\n"
+        "- With an account, your chats and documents are "
+        "saved and private to you"
+    )
 
 
 def render_attachments(attachments):
@@ -769,12 +1228,31 @@ st.write(
     "food, restaurants and nearby places."
 )
 
+# Plan and usage from the backend, refreshed each run.
+refresh_account()
+
+show_chat = st.session_state.page == "chat"
+
+if not show_chat:
+
+    st.button(
+        "← Back to chat",
+        on_click=go_to,
+        args=("chat",)
+    )
+
+    {
+        "settings": render_settings_page,
+        "plans": render_plans_page,
+        "help": render_help_page
+    }.get(st.session_state.page, render_help_page)()
+
 
 # =========================================================
 # DISPLAY PREVIOUS CONVERSATION
 # =========================================================
 
-for message in st.session_state.messages:
+for message in (st.session_state.messages if show_chat else []):
 
     role = message.get(
         "role",
@@ -817,18 +1295,20 @@ prompt = st.chat_input(
     "Ask me about your trip...",
     accept_file="multiple",
     file_type=SUPPORTED_FILE_TYPES
-)
+) if show_chat else None
 
 
 # =========================================================
-# GUEST MESSAGE LIMIT
+# USAGE LIMIT
 # =========================================================
-# Checked before anything is uploaded or sent, so a
-# blocked message never reaches FastAPI.
+# Uses the backend's usage figures. Checked before
+# anything is uploaded or sent, so a blocked message
+# never reaches FastAPI (the backend checks again).
 
-if prompt and guest_limit_reached():
+if prompt and usage_limit_reached():
 
-    st.session_state.auth_panel_open = True
+    if is_guest():
+        st.session_state.auth_panel_open = True
 
     prompt = None
 
@@ -948,6 +1428,27 @@ if prompt:
         st.stop()
 
     # -----------------------------------------------------
+    # LIMIT REACHED (checked by the backend first)
+    # -----------------------------------------------------
+
+    if result.get("limit_reached"):
+
+        # Not answered or saved: drop the question and
+        # show the upgrade / login panel.
+        st.session_state.messages.pop()
+
+        refresh_account()
+
+        if is_guest():
+            st.session_state.auth_panel_open = True
+
+        st.rerun()
+
+    # Updated usage returned with the answer.
+    if result.get("usage"):
+        st.session_state.usage = result["usage"]
+
+    # -----------------------------------------------------
     # GET ANSWER
     # -----------------------------------------------------
 
@@ -1026,16 +1527,6 @@ if prompt:
         }
     )
 
-    # -----------------------------------------------------
-    # COUNT GUEST QUESTION
-    # -----------------------------------------------------
-    # One per question actually answered; uploads and
-    # assistant replies are not counted, and neither
-    # are failures (e.g. Gemini busy or quota errors).
-
-    if is_guest() and route != "error":
-
-        st.session_state.guest_message_count += 1
 
 
 # =========================================================
@@ -1048,12 +1539,16 @@ if "auth_notice" in st.session_state:
         st.session_state.pop("auth_notice")
     )
 
-if is_guest() and (
+if show_chat and is_guest() and (
     st.session_state.auth_panel_open
     or guest_limit_reached()
 ):
 
     render_auth_panel()
+
+elif show_chat and not is_guest() and usage_limit_reached():
+
+    render_upgrade_panel()
 
 
 # =========================================================
@@ -1072,11 +1567,14 @@ with st.sidebar:
 
     if is_guest():
 
-        st.caption(
-            f"💬 Guest messages: "
-            f"{st.session_state.guest_message_count}"
-            f" / {GUEST_MESSAGE_LIMIT}"
-        )
+        usage = st.session_state.usage
+
+        if usage:
+            st.caption(
+                f"👤 Guest · Usage: "
+                f"{usage['messages']['used']} / "
+                f"{usage['messages']['limit']}"
+            )
 
         st.caption(
             "Log in to save your conversations "
@@ -1109,7 +1607,7 @@ with st.sidebar:
             width="stretch"
         ):
 
-            # Doesn't reset the guest message count.
+            # Doesn't reset the guest usage.
             st.session_state.messages = []
 
             clear_uploaded_documents()
@@ -1132,6 +1630,8 @@ with st.sidebar:
         ):
 
             start_new_chat()
+
+            st.session_state.page = "chat"
 
             st.rerun()
 
@@ -1190,7 +1690,45 @@ with st.sidebar:
 
                     else:
 
+                        st.session_state.page = "chat"
+
                         st.rerun()
+
+        # -----------------------------------------------------
+        # PLAN + USAGE
+        # -----------------------------------------------------
+
+        usage = st.session_state.usage
+
+        if usage:
+
+            st.divider()
+
+            st.caption(
+                f"⭐ {usage['plan_name']} Plan · Usage: "
+                f"{usage['messages']['used']} / "
+                f"{usage['messages']['limit']}"
+            )
+
+            if usage.get("subscription") and usage["plan"] != "free":
+
+                st.button(
+                    "Manage Subscription",
+                    key="sidebar_manage",
+                    width="stretch",
+                    on_click=go_to,
+                    args=("settings",)
+                )
+
+            else:
+
+                st.button(
+                    "Upgrade",
+                    key="sidebar_upgrade",
+                    width="stretch",
+                    on_click=go_to,
+                    args=("plans",)
+                )
 
     st.divider()
 
@@ -1293,12 +1831,28 @@ with st.sidebar:
                 st.rerun()
 
     # -----------------------------------------------------
-    # ACCOUNT
+    # SETTINGS / HELP / ACCOUNT
     # -----------------------------------------------------
 
-    if not is_guest():
+    st.divider()
 
-        st.divider()
+    st.button(
+        "⚙️ Settings",
+        key="nav_settings",
+        width="stretch",
+        on_click=go_to,
+        args=("settings",)
+    )
+
+    st.button(
+        "❓ Help",
+        key="nav_help",
+        width="stretch",
+        on_click=go_to,
+        args=("help",)
+    )
+
+    if not is_guest():
 
         st.caption(
             f"👤 {st.session_state.user['email']}"

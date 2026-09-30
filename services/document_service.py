@@ -1,5 +1,6 @@
 import base64
 import io
+import os
 import re
 import zipfile
 from pathlib import Path
@@ -24,7 +25,10 @@ load_dotenv()
 # Kept separate from the built-in travel vectorstore
 # so the two knowledge sources never mix. Persisted
 # so uploads survive `uvicorn --reload` restarts.
-UPLOADS_VECTORSTORE_DIR = "vectorstore_uploads"
+UPLOADS_VECTORSTORE_DIR = os.getenv(
+    "UPLOADS_VECTORSTORE_DIR",
+    "vectorstore_uploads"
+)
 
 SUPPORTED_FILE_TYPES = {
     "pdf",

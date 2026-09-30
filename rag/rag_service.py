@@ -5,6 +5,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 from rag.retriever import get_retriever
 from rag.prompt import GENERAL_PROMPT, SYSTEM_PROMPT
+from services.usage_service import add_tokens
 
 load_dotenv()
 
@@ -20,6 +21,10 @@ llm = ChatGoogleGenerativeAI(
 
 
 def extract_text(response):
+
+    # Report Gemini's own token counts for usage records
+    # (already in the response; no extra call).
+    add_tokens(getattr(response, "usage_metadata", None))
 
     if isinstance(response.content, str):
         return response.content

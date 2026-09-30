@@ -1,6 +1,6 @@
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import (
     HTTPAuthorizationCredentials,
@@ -29,8 +29,15 @@ from services.document_service import (
     list_documents,
     move_documents
 )
-from services import auth_service, database
+from services import auth_service, database, usage_service
 from services.auth_service import AuthError
+from services.payment_service import (
+    InvalidWebhook,
+    PaymentNotConfigured,
+    PaymentProviderError,
+    get_payment_provider
+)
+from services.plans import PLANS, public_plans
 from services.conversation_service import (
     ConversationError,
     document_store_key,
@@ -351,6 +358,63 @@ def delete_conversation(
 # UPLOADED DOCUMENTS (per conversation)
 # =========================================================
 
+def upload_within_limit(
+    store_key: str,
+    request: DocumentsRequest,
+    user: dict | None = None,
+    guest_key: str | None = None,
+    conversation_id: int | None = None
+) -> dict:
+    """
+    Store documents up to the plan's remaining document
+    allowance. Checked before embedding, so files over
+    the limit make no Gemini embedding calls.
+    """
+
+    usage = usage_service.get_usage_status(user, guest_key)
+
+    remaining = usage["documents"]["remaining"]
+
+    allowed = request.documents[:remaining]
+
+    errors = {
+        document.name: (
+            f"Document limit reached for the "
+            f"{usage['plan_name']} plan "
+            f"({usage['documents']['limit']} per "
+            f"{usage['period']}). "
+            + (
+                "Log in or create an account to upload more."
+                if user is None
+                else "Upgrade your plan to upload more."
+            )
+        )
+        for document in request.documents[remaining:]
+    }
+
+    result = (
+        add_documents(
+            store_key,
+            [document.model_dump() for document in allowed]
+        )
+        if allowed
+        else {"documents": [], "chunks": 0, "errors": {}}
+    )
+
+    # Only successfully stored documents count.
+    usage_service.record_document_uploads(
+        len(result["documents"]),
+        user=user,
+        guest_key=guest_key,
+        conversation_id=conversation_id
+    )
+
+    return {
+        **result,
+        "errors": {**result["errors"], **errors},
+        "limit_reached": bool(errors)
+    }
+
 @app.post("/conversations/{conversation_id}/documents")
 def upload_documents(
     conversation_id: int,
@@ -360,12 +424,11 @@ def upload_documents(
 
     get_owned_conversation(conversation_id, user["id"])
 
-    return add_documents(
+    return upload_within_limit(
         document_store_key(user["id"], conversation_id),
-        [
-            document.model_dump()
-            for document in request.documents
-        ]
+        request,
+        user=user,
+        conversation_id=conversation_id
     )
 
 
@@ -455,12 +518,10 @@ def upload_guest_documents(
     guest_key: str = Depends(get_guest_key)
 ):
 
-    return add_documents(
+    return upload_within_limit(
         guest_key,
-        [
-            document.model_dump()
-            for document in request.documents
-        ]
+        request,
+        guest_key=guest_key
     )
 
 
@@ -472,6 +533,162 @@ def delete_guest_documents(
     clear_documents(guest_key)
 
     return {"cleared": True}
+
+
+# =========================================================
+# PLANS, ACCOUNT & USAGE
+# =========================================================
+
+@app.get("/plans")
+def get_plans():
+    """
+    Plan limits and prices from configuration.
+    """
+
+    return public_plans()
+
+
+@app.get("/account")
+def get_account(
+    user: dict | None = Depends(get_optional_user),
+    x_guest_token: str | None = Header(default=None)
+):
+    """
+    The caller's own account, plan and usage. Only ever
+    about the authenticated user (or this guest session).
+    """
+
+    if user is None:
+
+        return {
+            "account": None,
+            "usage": usage_service.get_usage_status(
+                guest_key=get_guest_key(x_guest_token)
+            )
+        }
+
+    return {
+        "account": user,
+        "usage": usage_service.get_usage_status(user)
+    }
+
+
+# =========================================================
+# BILLING (payment provider not integrated yet)
+# =========================================================
+
+class CheckoutRequest(BaseModel):
+    plan: str
+
+
+@app.post("/billing/checkout")
+def start_checkout(
+    request: CheckoutRequest,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Returns a provider checkout URL. The plan changes only
+    later, when the provider's verified webhook arrives.
+    """
+
+    plan = PLANS.get(request.plan)
+
+    if not plan or not plan["purchasable"]:
+        raise HTTPException(
+            status_code=400,
+            detail="That plan can't be purchased."
+        )
+
+    # Avoid a second paid subscription for the same plan.
+    if usage_service.get_user_plan(user["id"])[0] == request.plan:
+        raise HTTPException(
+            status_code=409,
+            detail=f"You're already on the {plan['name']} plan."
+        )
+
+    try:
+
+        provider = get_payment_provider()
+
+        checkout_url = provider.create_checkout_session(
+            user,
+            request.plan
+        )
+
+    except PaymentNotConfigured as e:
+        raise HTTPException(status_code=501, detail=str(e))
+
+    except PaymentProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return {
+        "checkout_url": checkout_url,
+        "test_mode": getattr(provider, "test_mode", False)
+    }
+
+
+@app.post("/billing/portal")
+def open_billing_portal(
+    user: dict = Depends(get_current_user)
+):
+
+    try:
+
+        provider = get_payment_provider()
+
+        portal_url = provider.create_portal_session(user)
+
+    except PaymentNotConfigured as e:
+        raise HTTPException(status_code=501, detail=str(e))
+
+    except PaymentProviderError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return {"portal_url": portal_url}
+
+
+@app.post("/billing/webhook")
+async def billing_webhook(request: Request):
+    """
+    The only way a subscription changes: a payment
+    provider event whose signature the provider module
+    verifies with its secret. Duplicate and out-of-order
+    deliveries are skipped.
+    """
+
+    try:
+
+        provider = get_payment_provider()
+
+        event = provider.verify_webhook(
+            await request.body(),
+            dict(request.headers)
+        )
+
+    except PaymentNotConfigured as e:
+        raise HTTPException(status_code=501, detail=str(e))
+
+    except InvalidWebhook:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook signature."
+        )
+
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Malformed webhook."
+        )
+
+    # Verified but not relevant: acknowledge so the
+    # provider doesn't keep retrying.
+    if event is None:
+        return {"received": True, "result": "ignored"}
+
+    return {
+        "received": True,
+        "result": usage_service.process_subscription_event(event)
+    }
 
 
 # =========================================================
@@ -493,7 +710,12 @@ def ask(
 
     Guests: answers without saving anything, using only
     the guest's own uploaded documents.
+
+    Usage is checked BEFORE routing, so no Gemini call is
+    made once the plan's limit is reached.
     """
+
+    guest_key = None
 
     if user is None:
 
@@ -503,15 +725,43 @@ def ask(
                 detail="Please log in to continue."
             )
 
-        request.session_id = (
-            get_guest_key(x_guest_token)
-            if x_guest_token
-            else None
+        # Guests are identified by their session token so
+        # their usage can be counted.
+        guest_key = get_guest_key(x_guest_token)
+
+    # -----------------------------------------------------
+    # Usage limit (backend is the source of truth)
+    # -----------------------------------------------------
+
+    usage = usage_service.get_usage_status(user, guest_key)
+
+    if usage["limit_reached"]:
+
+        return {
+            **usage_service.limit_reached_response(usage),
+            "conversation_id": request.conversation_id
+        }
+
+    request_id = usage_service.new_request_id()
+
+    usage_service.start_token_tracking()
+
+    if user is None:
+
+        request.session_id = guest_key
+
+        result = answer_question(request)
+
+        record_answered_question(
+            result, request, request_id, guest_key=guest_key
         )
 
         return {
-            **answer_question(request),
-            "conversation_id": None
+            **result,
+            "conversation_id": None,
+            "usage": usage_service.get_usage_status(
+                guest_key=guest_key
+            )
         }
 
     if request.conversation_id is None:
@@ -561,10 +811,36 @@ def ask(
             }
         )
 
+    record_answered_question(
+        result,
+        request,
+        request_id,
+        user=user,
+        conversation_id=conversation["id"]
+    )
+
     return {
         **result,
-        "conversation_id": conversation["id"]
+        "conversation_id": conversation["id"],
+        "usage": usage_service.get_usage_status(user)
     }
+
+
+def record_answered_question(
+    result: dict,
+    request: QuestionRequest,
+    request_id: str,
+    **owner
+):
+    """
+    One usage unit per answered question. Empty
+    questions and failed answers (Gemini busy, quota)
+    are not counted.
+    """
+
+    if request.question.strip() and result.get("route") != "error":
+
+        usage_service.record_message(request_id, **owner)
 
 
 NO_TRAVEL_INFO_MESSAGE = (
